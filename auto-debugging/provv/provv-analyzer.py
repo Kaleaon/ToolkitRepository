@@ -59,12 +59,16 @@ class ProvvAnalyzer:
             
             # Determine file type and analyze accordingly
             if file_path.endswith('.py'):
-                return self._analyze_python(file_path, content)
+                issues = self._analyze_python(file_path, content)
             elif file_path.endswith(('.js', '.ts')):
-                return self._analyze_javascript(file_path, content)
+                issues = self._analyze_javascript(file_path, content)
             else:
                 self.logger.warning(f"Unsupported file type: {file_path}")
-                return []
+                issues = []
+            
+            # Store issues for reporting
+            self.issues.extend(issues)
+            return issues
                 
         except Exception as e:
             self.logger.error(f"Error analyzing {file_path}: {e}")
