@@ -1,0 +1,310 @@
+name: Static Analysis Tools
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      artifact_path:
+        description: 'Path to the APK or ZIP (relative to repo root)'
+        required: false
+        default: ''
+      max_heap_mb:
+        description: 'Max heap (MB) for tools like JADX/CFR'
+        required: false
+        default: '4096'
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install tools
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y unzip zip wget python3 python3-venv jq file apktool
+
+      - name: Detect analysis artifact (APK/ZIP)
+        id: detect
+        env:
+          INPUT_ARTIFACT: ${{ github.event.inputs.artifact_path }}
+        run: |
+          set -euxo pipefail
+          ART="$INPUT_ARTIFACT"
+          if [ -z "${ART}" ]; then
+            # Look for APK/ZIP files in repo
+            for CAND in *.apk *.zip; do
+              if [ -f "$CAND" ]; then ART="$CAND"; break; fi
+            done
+          fi
+          if [ -z "${ART}" ]; then
+            echo "::notice::No APK/ZIP artifact found. Creating sample analysis structure."
+            # Create a dummy APK structure for demonstration
+            mkdir -p sample-analysis
+            echo "No APK provided - creating sample structure" > sample-analysis/README.txt
+            ART="sample-analysis"
+          fi
+          echo "artifact=$ART" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare workspace
+        run: |
+          set -euxo pipefail
+          mkdir -p out/jadx out/apktool out/dex2jar out/ghidra out/native out/meta
+          if [ -f "${{ steps.detect.outputs.artifact }}" ]; then
+            cp "${{ steps.detect.outputs.artifact }}" in.bin
+          else
+            echo "No artifact file found, creating placeholder" > in.bin
+          fi
+
+      - name: Detect APK vs ZIP and extract APK if needed
+        id: artifact
+        run: |
+          set -euxo pipefail
+          FILE=in.bin
+          APK=analysis-target.apk
+          
+          if [ ! -s "$FILE" ]; then
+            echo "No valid input file, creating placeholder APK"
+            echo "placeholder" > "$APK"
+            echo "apk=$APK" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          
+          MIME=$(file -b --mime-type "$FILE" || true)
+          echo "MIME=$MIME"
+          if [[ "$MIME" == "application/zip" ]]; then
+            # If it already looks like an APK (classes.dex at root), just use it as APK
+            if unzip -l "$FILE" | grep -q "classes.dex"; then
+              cp "$FILE" "$APK"
+            else
+              # Try to extract first inner APK
+              INNER=$(unzip -l "$FILE" | awk '{print $4}' | grep -i '\.apk$' | head -n1 || true)
+              if [ -n "$INNER" ]; then
+                unzip -p "$FILE" "$INNER" > "$APK"
+              else
+                echo "::warning::Could not find an APK inside ZIP and no classes.dex present."
+                cp "$FILE" "$APK"
+              fi
+            fi
+          else
+            cp "$FILE" "$APK"
+          fi
+          echo "apk=$APK" >> "$GITHUB_OUTPUT"
+
+      - name: Dump APK meta
+        run: |
+          set -euxo pipefail
+          APK="${{ steps.artifact.outputs.apk }}"
+          if [ -f "$APK" ] && [ -s "$APK" ]; then
+            file "$APK" | tee out/meta/file_type.txt
+            if unzip -l "$APK" &>/dev/null; then
+              unzip -l "$APK" | tee out/meta/apk_zip_list.txt
+            else
+              echo "Not a valid ZIP/APK file" > out/meta/apk_zip_list.txt
+            fi
+          else
+            echo "No valid APK file for analysis" > out/meta/file_type.txt
+            echo "No APK contents" > out/meta/apk_zip_list.txt
+          fi
+
+      - name: apktool decode (resources + smali)
+        run: |
+          set -euxo pipefail
+          APK="${{ steps.artifact.outputs.apk }}"
+          if [ -f "$APK" ] && [ -s "$APK" ] && unzip -l "$APK" &>/dev/null; then
+            apktool d -f -o out/apktool "$APK" || echo "apktool decode failed"
+          else
+            echo "Skipping apktool - no valid APK"
+            mkdir -p out/apktool
+            echo "No valid APK for apktool analysis" > out/apktool/README.txt
+          fi
+
+      - name: Download JADX
+        run: |
+          set -euxo pipefail
+          JADX_VER=1.5.0
+          wget -q https://github.com/skylot/jadx/releases/download/v${JADX_VER}/jadx-${JADX_VER}.zip -O /tmp/jadx.zip
+          unzip -q /tmp/jadx.zip -d /opt/jadx
+          echo "/opt/jadx/bin" >> $GITHUB_PATH
+
+      - name: Run JADX (Java decompile)
+        env:
+          MAX_HEAP_MB: ${{ github.event.inputs.max_heap_mb || '4096' }}
+        run: |
+          set -euxo pipefail
+          APK="${{ steps.artifact.outputs.apk }}"
+          if [ -f "$APK" ] && [ -s "$APK" ] && unzip -l "$APK" &>/dev/null; then
+            jadx -j2 -Xmx${MAX_HEAP_MB}m -d out/jadx "$APK" || echo "JADX decompilation failed"
+          else
+            echo "Skipping JADX - no valid APK"
+            mkdir -p out/jadx
+            echo "No valid APK for JADX analysis" > out/jadx/README.txt
+          fi
+
+      - name: Download dex2jar and CFR
+        run: |
+          set -euxo pipefail
+          D2J_VER=2.1
+          wget -q https://github.com/pxb1988/dex2jar/releases/download/v${D2J_VER}/dex2jar-${D2J_VER}.zip -O /tmp/d2j.zip
+          unzip -q /tmp/d2j.zip -d /opt/d2j
+          echo "/opt/d2j" >> $GITHUB_PATH
+          CFR_VER=0.152
+          wget -q https://www.benf.org/other/cfr/cfr-${CFR_VER}.jar -O /opt/cfr.jar
+
+      - name: Run dex2jar + CFR (alternate decompile path)
+        env:
+          MAX_HEAP_MB: ${{ github.event.inputs.max_heap_mb || '4096' }}
+        run: |
+          set -euxo pipefail
+          APK="${{ steps.artifact.outputs.apk }}"
+          if [ -f "$APK" ] && [ -s "$APK" ] && unzip -l "$APK" &>/dev/null; then
+            mkdir -p out/dex2jar/src
+            /opt/d2j/d2j-dex2jar.sh -f -o out/dex2jar/classes.jar "$APK" || echo "dex2jar failed"
+            if [ -f "out/dex2jar/classes.jar" ]; then
+              java -Xmx${MAX_HEAP_MB}m -jar /opt/cfr.jar out/dex2jar/classes.jar --outputdir out/dex2jar/src || echo "CFR failed"
+            fi
+          else
+            echo "Skipping dex2jar - no valid APK"
+            mkdir -p out/dex2jar
+            echo "No valid APK for dex2jar analysis" > out/dex2jar/README.txt
+          fi
+
+      - name: Extract native libs (.so) if present
+        run: |
+          set -euxo pipefail
+          APK="${{ steps.artifact.outputs.apk }}"
+          if [ -f "$APK" ] && [ -s "$APK" ] && unzip -l "$APK" &>/dev/null; then
+            unzip -Z1 "$APK" | grep -E '^lib/.+\.so$' | while read -r so; do
+              unzip -p "$APK" "$so" > "out/native/$(basename "$so")"
+            done || true
+          fi
+          ls -la out/native || true
+          if [ ! "$(ls -A out/native 2>/dev/null)" ]; then
+            echo "No native libraries found" > out/native/README.txt
+          fi
+
+      - name: Download Ghidra
+        run: |
+          set -euxo pipefail
+          # Try to download Ghidra, with fallback
+          GHIDRA_VER=11.4.2
+          if ! wget -q https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VER}_build/ghidra_${GHIDRA_VER}_PUBLIC_20250826.zip -O /tmp/ghidra.zip; then
+            echo "Failed to download specific Ghidra version, skipping Ghidra analysis"
+            mkdir -p out/ghidra
+            echo "Ghidra download failed" > out/ghidra/README.txt
+            exit 0
+          fi
+          unzip -q /tmp/ghidra.zip -d /opt
+          GHIDRA_DIR=$(find /opt -maxdepth 1 -type d -name 'ghidra*' | head -n1)
+          echo "GHIDRA_DIR=$GHIDRA_DIR" >> $GITHUB_ENV
+
+      - name: Run Ghidra headless on native libs (if any)
+        if: ${{ hashFiles('out/native/*.so') != '' }}
+        run: |
+          set -euxo pipefail
+          GHIDRA_DIR="${{ env.GHIDRA_DIR }}"
+          if [ -z "$GHIDRA_DIR" ] || [ ! -d "$GHIDRA_DIR" ]; then
+            echo "Ghidra not available, skipping analysis"
+            exit 0
+          fi
+          
+          PROJ_DIR="$PWD/out/ghidra/project"
+          mkdir -p "$PROJ_DIR" out/ghidra/reports
+          
+          # Create a simple Ghidra script if tools/ghidra directory doesn't exist
+          if [ ! -d "tools/ghidra" ]; then
+            mkdir -p tools/ghidra
+            cat > tools/ghidra/dump_symbols.py << 'EOF'
+# Simple Ghidra script to dump function symbols
+import json
+import sys
+
+def run():
+    current_program = getCurrentProgram()
+    if current_program is None:
+        print("No program loaded")
+        return
+    
+    functions = current_program.getFunctionManager().getFunctions(True)
+    result = {"functions": []}
+    
+    for func in functions:
+        result["functions"].append({
+            "name": func.getName(),
+            "address": str(func.getEntryPoint()),
+            "signature": str(func.getSignature())
+        })
+    
+    output_file = sys.argv[1] if len(sys.argv) > 1 else "functions.json"
+    with open(output_file, 'w') as f:
+        json.dump(result, f, indent=2)
+    
+    print("Exported {} functions to {}".format(len(result["functions"]), output_file))
+
+if __name__ == "__main__":
+    run()
+EOF
+          fi
+          
+          SCRIPT_DIR="$PWD/tools/ghidra"
+          for so in out/native/*.so; do
+            if [ -f "$so" ]; then
+              base=$(basename "$so")
+              out_json="out/ghidra/reports/${base}.functions.json"
+              "$GHIDRA_DIR/support/analyzeHeadless" "$PROJ_DIR" AnalysisProject \
+                -import "$so" \
+                -scriptPath "$SCRIPT_DIR" \
+                -postScript dump_symbols.py "$out_json" \
+                -deleteProject || echo "Ghidra analysis failed for $base"
+            fi
+          done
+
+      - name: Create Analysis Summary
+        run: |
+          echo "# Static Analysis Results" > out/ANALYSIS_SUMMARY.md
+          echo "" >> out/ANALYSIS_SUMMARY.md
+          echo "## Analysis Overview" >> out/ANALYSIS_SUMMARY.md
+          echo "- **Target**: ${{ steps.detect.outputs.artifact }}" >> out/ANALYSIS_SUMMARY.md
+          echo "- **Date**: $(date)" >> out/ANALYSIS_SUMMARY.md
+          echo "" >> out/ANALYSIS_SUMMARY.md
+          
+          echo "## Tools Used" >> out/ANALYSIS_SUMMARY.md
+          echo "- **apktool**: Resource and smali extraction" >> out/ANALYSIS_SUMMARY.md
+          echo "- **JADX**: Java decompilation" >> out/ANALYSIS_SUMMARY.md
+          echo "- **dex2jar + CFR**: Alternative decompilation" >> out/ANALYSIS_SUMMARY.md
+          echo "- **Ghidra**: Native library analysis" >> out/ANALYSIS_SUMMARY.md
+          echo "" >> out/ANALYSIS_SUMMARY.md
+          
+          echo "## Results Structure" >> out/ANALYSIS_SUMMARY.md
+          echo "- \`meta/\`: File metadata and structure info" >> out/ANALYSIS_SUMMARY.md
+          echo "- \`apktool/\`: Extracted resources and smali code" >> out/ANALYSIS_SUMMARY.md
+          echo "- \`jadx/\`: Decompiled Java source code" >> out/ANALYSIS_SUMMARY.md
+          echo "- \`dex2jar/\`: Alternative decompiled source" >> out/ANALYSIS_SUMMARY.md
+          echo "- \`native/\`: Extracted native libraries (.so files)" >> out/ANALYSIS_SUMMARY.md
+          echo "- \`ghidra/\`: Native code analysis results" >> out/ANALYSIS_SUMMARY.md
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: static-analysis-results
+          path: |
+            out/jadx/**
+            out/apktool/**
+            out/dex2jar/**
+            out/ghidra/**
+            out/native/**
+            out/meta/**
+            out/ANALYSIS_SUMMARY.md
+          retention-days: 14
